@@ -1,0 +1,16 @@
+# Секрети
+.env
+
+# Python
+venv/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+
+# macOS
+.DS_Store
+
+# Logs
+*.log
