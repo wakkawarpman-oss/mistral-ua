@@ -1,0 +1,44 @@
+name: CI
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+    branches: [main, master]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python-version: ["3.11"]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+
+      - name: Install dependencies
+        run: |
+          pip install --upgrade pip
+          # MLX is Apple-only; skip on Linux CI
+          grep -v "mlx" requirements.txt > /tmp/req_ci.txt || cp requirements.txt /tmp/req_ci.txt
+          pip install -r /tmp/req_ci.txt
+          pip install pytest pytest-asyncio
+
+      - name: Run tests (no MLX)
+        env:
+          GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
+          OLLAMA_URL: http://localhost:11434
+        run: |
+          python -m pytest tests/test_core.py -v --tb=short \
+            --ignore=tests/test_mlx.py 2>&1
+
+      - name: Lint check (basic)
+        run: |
+          pip install pyflakes -q
+          python -m pyflakes modules.py executor.py rag.py mistral_api.py || true

@@ -159,6 +159,95 @@ class MistralML:
             temperature=0.3,
         )
 
+    def doublecheck(self, question: str, answer: str) -> str:
+        """Верифікує відповідь: точність, логіка, пропуски, вердикт."""
+        from modules import MODULES
+        system = MODULES["doublecheck"]["system"]
+        prompt = f"ПИТАННЯ:\n{question}\n\nВІДПОВІДЬ ДО ПЕРЕВІРКИ:\n{answer}"
+        return self.ask(prompt, system=system, temperature=0.3)
+
+    # ── Function calling (Groq tool_calls API) ────────────────────────────────
+
+    def call_tool(
+        self,
+        prompt: str,
+        tools: list[dict],
+        system: str = ML_ENGINEER_SYSTEM,
+        temperature: float = 0.3,
+    ) -> dict:
+        """
+        Викликає Groq tool_calls API.
+        tools — список OpenAI-style function schemas:
+          [{"type":"function","function":{"name":...,"description":...,"parameters":{...}}}]
+        Повертає:
+          {"tool": str, "args": dict}  — коли модель обрала інструмент
+          {"content": str}             — коли звичайна відповідь
+          {"error": str}               — при помилці
+        """
+        if self.backend != "groq":
+            return {"error": "Function calling доступне лише через Groq API"}
+
+        messages = [
+            {"role": "system", "content": system},
+            {"role": "user",   "content": prompt},
+        ]
+        try:
+            client = _Groq(api_key=GROQ_API_KEY)
+            resp = client.chat.completions.create(
+                model=GROQ_MODEL,
+                messages=messages,
+                tools=tools,
+                tool_choice="auto",
+                temperature=temperature,
+                max_tokens=1024,
+            )
+            choice = resp.choices[0]
+            if choice.finish_reason == "tool_calls" and choice.message.tool_calls:
+                tc = choice.message.tool_calls[0]
+                return {
+                    "tool": tc.function.name,
+                    "args": json.loads(tc.function.arguments),
+                }
+            return {"content": choice.message.content or ""}
+        except Exception as e:
+            return {"error": str(e)}
+
+    def structured_output(
+        self,
+        prompt: str,
+        schema: dict,
+        name: str = "respond",
+        description: str = "Structured response",
+        system: str = ML_ENGINEER_SYSTEM,
+    ) -> dict:
+        """
+        Витягує структуровані дані за JSON-схемою через function calling.
+        Повертає розпарсений dict або {"error": str}.
+        """
+        tool = {
+            "type": "function",
+            "function": {
+                "name": name,
+                "description": description,
+                "parameters": schema,
+            },
+        }
+        result = self.call_tool(prompt, tools=[tool], system=system)
+        if "args" in result:
+            return result["args"]
+        if "error" in result:
+            return result
+        # fallback: намагаємось розпарсити JSON з вільного тексту
+        try:
+            content = result.get("content", "")
+            start = content.find("{")
+            end   = content.rfind("}") + 1
+            if start != -1 and end > start:
+                return json.loads(content[start:end])
+        except Exception:
+            pass
+        return {"error": "Не вдалося витягти структуровані дані", "raw": result.get("content", "")}
+
     def clear_history(self):
         self.history = []
 
@@ -168,161 +257,3 @@ if __name__ == "__main__":
     print(f"Бекенд: {ml.backend}")
     if ml.is_ready():
         print(ml.ask("Привіт! Що ти вмієш?"))
-
-
-ML_ENGINEER_SYSTEM = """Ти — асиметричний ML-інженер R&D.
-Аналізуй проблеми з неочевидних кутів. Шукай прості рішення там де всі шукають складні.
-Відповідай конкретно. Надавай робочий Python код. Вказуй на слабкі місця підходів."""
-
-
-class MistralML:
-    """Клієнт для Mistral через Ollama"""
-
-    def __init__(self, model: str = DEFAULT_MODEL, url: str = OLLAMA_URL):
-        self.model = model
-        self.url = url
-        self.history = []
-
-    def is_ready(self) -> bool:
-        """Перевірка готовності сервісу"""
-        try:
-            resp = requests.get(f"{self.url}/api/tags", timeout=3)
-            if resp.status_code != 200:
-                return False
-            models = [m["name"] for m in resp.json().get("models", [])]
-            return any(self.model.split(":")[0] in m for m in models)
-        except Exception:
-            return False
-
-    def list_models(self) -> list:
-        """Список доступних моделей"""
-        try:
-            resp = requests.get(f"{self.url}/api/tags", timeout=3)
-            return [m["name"] for m in resp.json().get("models", [])]
-        except Exception:
-            return []
-
-    def ask(
-        self,
-        prompt: str,
-        system: str = ML_ENGINEER_SYSTEM,
-        temperature: float = 0.7,
-        keep_history: bool = False
-    ) -> str:
-        """Одиночний запит без стрімінгу"""
-        messages = [{"role": "system", "content": system}]
-
-        if keep_history:
-            messages += self.history
-
-        messages.append({"role": "user", "content": prompt})
-
-        payload = {
-            "model": self.model,
-            "messages": messages,
-            "stream": False,
-            "options": {
-                "temperature": temperature,
-                "num_ctx": 4096,
-                "num_predict": 2048,
-            }
-        }
-
-        try:
-            resp = requests.post(
-                f"{self.url}/api/chat",
-                json=payload,
-                timeout=120
-            )
-            result = resp.json()["message"]["content"]
-
-            if keep_history:
-                self.history.append({"role": "user", "content": prompt})
-                self.history.append({"role": "assistant", "content": result})
-
-            return result
-        except Exception as e:
-            return f"Помилка: {e}"
-
-    def stream(
-        self,
-        prompt: str,
-        system: str = ML_ENGINEER_SYSTEM,
-        temperature: float = 0.7
-    ) -> Generator[str, None, None]:
-        """Стрімінг відповіді"""
-        messages = [
-            {"role": "system", "content": system},
-            {"role": "user", "content": prompt}
-        ]
-
-        payload = {
-            "model": self.model,
-            "messages": messages,
-            "stream": True,
-            "options": {"temperature": temperature, "num_ctx": 4096}
-        }
-
-        with requests.post(
-            f"{self.url}/api/chat",
-            json=payload,
-            stream=True,
-            timeout=120
-        ) as resp:
-            for line in resp.iter_lines():
-                if line:
-                    try:
-                        data = json.loads(line.decode("utf-8"))
-                        if chunk := data.get("message", {}).get("content", ""):
-                            yield chunk
-                        if data.get("done"):
-                            break
-                    except json.JSONDecodeError:
-                        continue
-
-    def analyze_asymmetric(self, problem: str) -> str:
-        """Асиметричний аналіз проблеми"""
-        prompt = f"""Проаналізуй цю проблему з асиметричної точки зору:
-
-ПРОБЛЕМА: {problem}
-
-Дай відповідь у форматі:
-1. СТАНДАРТНЕ РІШЕННЯ (яке всі використовують і чому воно може бути неефективним)
-2. СЛАБКІ МІСЦЯ стандартного підходу
-3. АСИМЕТРИЧНЕ РІШЕННЯ (просте, але неочевидне)
-4. РЕАЛІЗАЦІЯ (конкретні кроки або код)
-5. РИЗИКИ та як їх мінімізувати"""
-
-        return self.ask(prompt, temperature=0.8)
-
-    def generate_code(self, task: str) -> str:
-        """Генерація Python коду"""
-        prompt = f"""Напиши робочий Python код для: {task}
-
-Вимоги:
-- Оптимізовано для Apple M2 (8GB RAM)
-- Використовуй MPS backend для PyTorch якщо потрібно
-- Мінімальні залежності
-- Коментарі українською мовою
-- Передбач обробку помилок"""
-
-        return self.ask(prompt, temperature=0.3)
-
-    def clear_history(self):
-        """Очистити історію розмови"""
-        self.history = []
-
-
-# Приклад використання
-if __name__ == "__main__":
-    ml = MistralML()
-
-    if not ml.is_ready():
-        print(f"Сервіс недоступний. Доступні моделі: {ml.list_models()}")
-        exit(1)
-
-    # Тест асиметричного аналізу
-    result = ml.analyze_asymmetric(
-        "Як навчити ML-модель з мінімумом розміченних даних?"
-    )
-    print(result)

@@ -7,11 +7,14 @@
 import os
 import json
 import asyncio
+import subprocess
 from pathlib import Path
 from dotenv import load_dotenv
 from fastapi import FastAPI, Request
-from fastapi.responses import HTMLResponse, StreamingResponse
+from fastapi.responses import HTMLResponse, StreamingResponse, JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
+from modules import MODULES
+from executor import run_code, format_result as fmt_exec
 
 load_dotenv()
 
@@ -29,6 +32,22 @@ SYSTEM_PROMPT = """Ти — Містраль, асиметричний інже�
 Використовуй вбудовані інженерні модулі: логіка, причинно-наслідковий аналіз,
 red team, стратегія, код, аудит, DevOps, QA, DSP, CV, оптимізація, системна інженерія."""
 
+DOUBLECHECK_SYSTEM = """Ти — Містраль у режимі DoubleCheck. Твоя єдина роль: незалежна верифікація.
+
+Отримаєш ПИТАННЯ та ВІДПОВІДЬ. Виконай аналіз за структурою:
+
+1. ТОЧНІСТЬ — перевір кожне фактичне твердження (чи відповідає реальності)
+2. ЛОГІКА — є внутрішні суперечності або хибні умовиводи?
+3. ПРОПУСКИ — що важливе не згадано, проігноровано або спрощено надмірно?
+4. ВПЕВНЕНІСТЬ — оціни достовірність відповіді у відсотках (0–100%)
+5. ВЕРДИКТ:
+   ✅ Підтверджено — відповідь точна
+   ⚠️ Частково — є неточності, дай уточнення
+   ❌ Помилка — дай виправлену версію
+
+Будь критичним, але справедливим. Не повторюй відповідь без потреби.
+Відповідай українською."""
+
 app = FastAPI()
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
@@ -38,15 +57,39 @@ async def index():
     return HTML
 
 
+@app.get("/modules")
+async def get_modules():
+    return JSONResponse([{"key": k, "label": v["label"], "desc": v["desc"]}
+                         for k, v in MODULES.items()])
+
+
+@app.post("/execute")
+async def execute_code(request: Request):
+    body = await request.json()
+    code = body.get("code", "").strip()
+    if not code:
+        return JSONResponse({"error": "no code"})
+    r = run_code(code)
+    return JSONResponse({
+        "stdout":     r["stdout"],
+        "stderr":     r["stderr"],
+        "returncode": r["returncode"],
+        "error":      r.get("error"),
+        "formatted":  fmt_exec(r),
+    })
+
+
 @app.post("/chat")
 async def chat(request: Request):
     body = await request.json()
     messages = body.get("messages", [])
+    module_key = body.get("module", "ml")
 
     if not messages:
         return {"error": "no messages"}
 
-    full_messages = [{"role": "system", "content": SYSTEM_PROMPT}] + messages
+    system = MODULES.get(module_key, MODULES["ml"])["system"]
+    full_messages = [{"role": "system", "content": system}] + messages
 
     async def generate():
         if _GROQ_AVAILABLE and GROQ_API_KEY:
@@ -68,6 +111,53 @@ async def chat(request: Request):
                 "messages": full_messages,
                 "stream": True,
                 "options": {"temperature": 0.7, "num_ctx": 8192},
+            }
+            async with httpx.AsyncClient(timeout=120) as client:
+                async with client.stream("POST", "http://localhost:11434/api/chat", json=payload) as r:
+                    async for line in r.aiter_lines():
+                        if line:
+                            try:
+                                data = json.loads(line)
+                                chunk = data.get("message", {}).get("content", "")
+                                if chunk:
+                                    yield f"data: {json.dumps({'content': chunk})}\n\n"
+                            except Exception:
+                                continue
+        yield "data: [DONE]\n\n"
+
+    return StreamingResponse(generate(), media_type="text/event-stream")
+
+
+@app.post("/doublecheck")
+async def doublecheck_endpoint(request: Request):
+    body = await request.json()
+    question = body.get("question", "")
+    answer = body.get("answer", "")
+    msgs = [
+        {"role": "system", "content": DOUBLECHECK_SYSTEM},
+        {"role": "user", "content": f"ПИТАННЯ:\n{question}\n\nВІДПОВІДЬ ДО ПЕРЕВІРКИ:\n{answer}"},
+    ]
+
+    async def generate():
+        if _GROQ_AVAILABLE and GROQ_API_KEY:
+            client = AsyncGroq(api_key=GROQ_API_KEY)
+            async with client.chat.completions.stream(
+                model=GROQ_MODEL,
+                messages=msgs,
+                temperature=0.3,
+                max_tokens=2048,
+            ) as stream:
+                async for chunk in stream:
+                    delta = chunk.choices[0].delta.content or ""
+                    if delta:
+                        yield f"data: {json.dumps({'content': delta})}\n\n"
+        else:
+            import httpx
+            payload = {
+                "model": os.getenv("OLLAMA_MODEL", "mistral-ua"),
+                "messages": msgs,
+                "stream": True,
+                "options": {"temperature": 0.3, "num_ctx": 8192},
             }
             async with httpx.AsyncClient(timeout=120) as client:
                 async with client.stream("POST", "http://localhost:11434/api/chat", json=payload) as r:
@@ -107,15 +197,20 @@ HTML = """<!DOCTYPE html>
   header {
     background: var(--bg2);
     border-bottom: 1px solid var(--border);
-    padding: 12px 16px;
-    padding-top: max(12px, env(safe-area-inset-top));
-    display: flex; align-items: center; gap: 10px;
-    position: sticky; top: 0; z-index: 10;
+    padding: 8px 12px;
+    padding-top: max(8px, env(safe-area-inset-top));
+    display: flex; align-items: center; gap: 8px;
+    position: sticky; top: 0; z-index: 10; flex-wrap: wrap;
   }
-  .logo { width: 32px; height: 32px; background: var(--user); border-radius: 8px;
-    display: flex; align-items: center; justify-content: center; font-size: 16px; flex-shrink: 0; }
-  .header-info h1 { font-size: 16px; font-weight: 600; }
-  .header-info span { font-size: 11px; color: var(--bot); }
+  .logo { width: 30px; height: 30px; background: var(--user); border-radius: 8px;
+    display: flex; align-items: center; justify-content: center; font-size: 15px; flex-shrink: 0; }
+  .header-info h1 { font-size: 15px; font-weight: 600; }
+  .header-info span { font-size: 10px; color: var(--bot); }
+  #module-select {
+    background: var(--bg); border: 1px solid var(--border); color: var(--text);
+    border-radius: 8px; font-size: 12px; padding: 4px 8px; cursor: pointer; max-width: 160px;
+  }
+  #metrics-label { font-size: 10px; color: var(--muted); white-space: nowrap; }
 
   #messages {
     flex: 1; overflow-y: auto; padding: 16px; display: flex;
@@ -177,6 +272,15 @@ HTML = """<!DOCTYPE html>
     background: none; border: 1px solid var(--border); color: var(--muted);
     font-size: 14px; width: auto; padding: 0 10px; border-radius: 8px;
   }
+  .dc-btn {
+    background: none; border: 1px solid #3fb950; color: #3fb950;
+    font-size: 12px; width: auto; padding: 3px 10px; border-radius: 8px;
+    margin-top: 4px; cursor: pointer; align-self: flex-start; transition: opacity 0.2s;
+  }
+  .dc-btn:disabled { opacity: 0.4; pointer-events: none; }
+  .dc-btn:active { opacity: 0.6; }
+  .msg.dc-result .bubble { border-color: #f0883e; }
+  .msg.dc-result .msg-label { color: #f0883e !important; }
 
   /* iOS Safari: footer тримається над клавіатурою */
   footer { position: fixed; left: 0; right: 0; bottom: 0; }
@@ -188,8 +292,10 @@ HTML = """<!DOCTYPE html>
   <div class="logo">⬡</div>
   <div class="header-info">
     <h1>Містраль</h1>
-    <span id="backend-label">Groq LPU · ~500 tok/s</span>
+    <span id="backend-label">Groq LPU</span>
   </div>
+  <select id="module-select" onchange="onModuleChange(this.value)"><option value="">завантаження...</option></select>
+  <span id="metrics-label">—</span>
   <button type="button" class="clear-btn" id="clear-btn" style="margin-left:auto">Очистити</button>
 </header>
 
@@ -210,6 +316,33 @@ HTML = """<!DOCTYPE html>
 <script>
 const messages = [];
 let busy = false;
+let currentModule = 'ml';
+let tStart = 0, tokenCount = 0;
+
+// ── Завантаження модулів ──────────────────────────────────────────
+async function loadModules() {
+  try {
+    const res = await fetch('/modules');
+    const mods = await res.json();
+    const sel = document.getElementById('module-select');
+    sel.innerHTML = mods.map(m =>
+      `<option value="${m.key}" title="${m.desc}">${m.label}</option>`
+    ).join('');
+    sel.value = currentModule;
+  } catch(e) { console.error('modules load error', e); }
+}
+
+function onModuleChange(key) {
+  currentModule = key;
+  messages.length = 0;
+  const sel = document.getElementById('module-select');
+  const label = sel.options[sel.selectedIndex]?.text || key;
+  const wrap = document.getElementById('messages');
+  wrap.innerHTML = `<div class="msg bot">
+    <span class="msg-label">Містраль</span>
+    <div class="bubble">Режим: <b>${label}</b>. Контекст очищено.</div>
+  </div>`;
+}
 
 // iOS Safari: footer тримається над клавіатурою через visualViewport API
 if (window.visualViewport) {
@@ -223,9 +356,9 @@ if (window.visualViewport) {
   window.visualViewport.addEventListener('scroll', adjust);
 }
 
-// Прив'язуємо кнопки через JS (надійніше за onclick на iOS)
 document.getElementById('send-btn').addEventListener('click', send);
 document.getElementById('clear-btn').addEventListener('click', clearChat);
+loadModules();
 
 function autoResize(el) {
   el.style.height = 'auto';
@@ -294,12 +427,13 @@ async function send() {
 
   let full = '';
   let bubble = null;
+  tStart = Date.now(); tokenCount = 0;
 
   try {
     const res = await fetch('/chat', {
       method: 'POST',
       headers: {'Content-Type': 'application/json'},
-      body: JSON.stringify({messages}),
+      body: JSON.stringify({messages, module: currentModule}),
     });
 
     const reader = res.body.getReader();
@@ -317,6 +451,7 @@ async function send() {
           const {content} = JSON.parse(data);
           if (!bubble) { removeTyping(); bubble = addMsg('bot', ''); }
           full += content;
+          tokenCount += content.split(/\s+/).length;
           bubble.innerHTML = renderBubble(full);
           scrollDown();
         } catch {}
@@ -327,7 +462,19 @@ async function send() {
     addMsg('bot', 'Помилка з\'єднання: ' + e.message);
   }
 
-  if (full) messages.push({role: 'assistant', content: full});
+  if (full) {
+    const elapsed = (Date.now() - tStart) / 1000;
+    const tps = elapsed > 0 ? Math.round(tokenCount / elapsed) : 0;
+    document.getElementById('metrics-label').textContent = `${tps} tok/s · ${elapsed.toFixed(1)}s`;
+    messages.push({role: 'assistant', content: full});
+    const dcBtn = document.createElement('button');
+    dcBtn.className = 'dc-btn';
+    dcBtn.textContent = '⟳ DoubleCheck';
+    const q = text;
+    const a = full;
+    dcBtn.addEventListener('click', () => doDoubleCheck(dcBtn, q, a));
+    bubble.parentElement.appendChild(dcBtn);
+  }
   busy = false;
   document.getElementById('send-btn').disabled = false;
   // не викликаємо input.focus() — на iOS це знову підіймає клавіатуру і зсуває layout
@@ -340,6 +487,58 @@ function clearChat() {
     <span class="msg-label">Містраль</span>
     <div class="bubble">Контекст очищено. Пиши.</div>
   </div>`;
+}
+
+function addDCMsg() {
+  const wrap = document.getElementById('messages');
+  const div = document.createElement('div');
+  div.className = 'msg bot dc-result';
+  div.innerHTML = '<span class="msg-label">⟳ DoubleCheck</span><div class="bubble"></div>';
+  wrap.appendChild(div);
+  scrollDown();
+  return div.querySelector('.bubble');
+}
+
+async function doDoubleCheck(btn, question, answer) {
+  if (busy) return;
+  btn.disabled = true;
+  busy = true;
+  document.getElementById('send-btn').disabled = true;
+  addTyping();
+  let full = '';
+  let bubble = null;
+  try {
+    const res = await fetch('/doublecheck', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({question, answer}),
+    });
+    const reader = res.body.getReader();
+    const decoder = new TextDecoder();
+    while (true) {
+      const {done, value} = await reader.read();
+      if (done) break;
+      const lines = decoder.decode(value).split('\n');
+      for (const line of lines) {
+        if (!line.startsWith('data: ')) continue;
+        const data = line.slice(6);
+        if (data === '[DONE]') break;
+        try {
+          const {content} = JSON.parse(data);
+          if (!bubble) { removeTyping(); bubble = addDCMsg(); }
+          full += content;
+          bubble.innerHTML = renderBubble(full);
+          scrollDown();
+        } catch {}
+      }
+    }
+  } catch(e) {
+    removeTyping();
+    addMsg('bot', 'DoubleCheck помилка: ' + e.message);
+  }
+  busy = false;
+  document.getElementById('send-btn').disabled = false;
+  btn.remove();
 }
 </script>
 </body>
