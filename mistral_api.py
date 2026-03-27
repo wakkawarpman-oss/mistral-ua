@@ -74,14 +74,21 @@ class MistralML:
 
     def _ask_groq(self, messages: list, temperature: float) -> str:
         client = _Groq(api_key=GROQ_API_KEY)
-        resp = client.chat.completions.create(
-            model=GROQ_MODEL,
-            messages=messages,
-            temperature=temperature,
-            max_tokens=4096,
-            stream=False,
-        )
-        return resp.choices[0].message.content or ""
+        try:
+            resp = client.chat.completions.create(
+                model=GROQ_MODEL,
+                messages=messages,
+                temperature=temperature,
+                max_tokens=4096,
+                stream=False,
+            )
+            return resp.choices[0].message.content or ""
+        except Exception as e:
+            if "rate_limit_exceeded" in str(e) or "429" in str(e):
+                import sys
+                print("[Groq 429] Rate limit — fallback на Ollama", file=sys.stderr)
+                return self._ask_ollama(messages, temperature)
+            raise
 
     def _ask_ollama(self, messages: list, temperature: float) -> str:
         payload = {
@@ -113,15 +120,23 @@ class MistralML:
 
     def _stream_groq(self, messages: list, temperature: float) -> Generator[str, None, None]:
         client = _Groq(api_key=GROQ_API_KEY)
-        with client.chat.completions.create(
-            model=GROQ_MODEL,
-            messages=messages,
-            temperature=temperature,
-            max_tokens=4096,
-            stream=True,
-        ) as s:
-            for chunk in s:
-                yield chunk.choices[0].delta.content or ""
+        try:
+            with client.chat.completions.create(
+                model=GROQ_MODEL,
+                messages=messages,
+                temperature=temperature,
+                max_tokens=4096,
+                stream=True,
+            ) as s:
+                for chunk in s:
+                    yield chunk.choices[0].delta.content or ""
+        except Exception as e:
+            if "rate_limit_exceeded" in str(e) or "429" in str(e):
+                import sys
+                print("[Groq 429] Rate limit — fallback на Ollama", file=sys.stderr)
+                yield from self._stream_ollama(messages, temperature)
+            else:
+                raise
 
     def _stream_ollama(self, messages: list, temperature: float) -> Generator[str, None, None]:
         payload = {
